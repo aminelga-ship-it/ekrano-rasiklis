@@ -11,7 +11,10 @@ a = Analysis(
     [os.path.join(spec_dir, "whiteboard_tool.py")],
     pathex=[spec_dir],
     binaries=keyboard_binaries,
-    datas=[(os.path.join(spec_dir, "guest.html"), ".")] + keyboard_datas,
+    datas=[
+        (os.path.join(spec_dir, "guest.html"), "."),
+        (os.path.join(spec_dir, "assets", "stickers"), os.path.join("assets", "stickers")),
+    ] + keyboard_datas,
     hiddenimports=[
         "PyQt5",
         "PyQt5.QtCore",

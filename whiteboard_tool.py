@@ -8,6 +8,7 @@ import ctypes
 import math
 import os
 import secrets
+import shutil
 import signal
 import struct
 import subprocess
@@ -111,10 +112,38 @@ HANDLE_SIZE = 12
 MIN_OBJECT_SCALE = 0.15
 MAX_OBJECT_SCALE = 4.0
 HOTKEY_COOLDOWN = 0.6
-STICKERS_DIR = r"C:\Users\amine\Downloads\Matematikos stickers"
-FUNKCIJOS_DIR = r"C:\Users\amine\Downloads\Matematikos stickers\Funkcijos"
 STICKER_MAX_SIZE = 900
 FIGURE_MAX_SIZE = 450
+
+
+def _bundled_stickers_dir():
+    return os.path.join(resource_dir(), "assets", "stickers")
+
+
+def _copy_sticker_tree(src, dest):
+    if not os.path.isdir(src):
+        return
+    os.makedirs(dest, exist_ok=True)
+    for name in os.listdir(src):
+        from_path = os.path.join(src, name)
+        to_path = os.path.join(dest, name)
+        if os.path.isdir(from_path):
+            _copy_sticker_tree(from_path, to_path)
+        elif os.path.isfile(from_path) and not os.path.isfile(to_path):
+            shutil.copy2(from_path, to_path)
+
+
+def stickers_dir():
+    bundled = _bundled_stickers_dir()
+    if not is_frozen():
+        return bundled
+    dest = os.path.join(data_dir(), "stickers")
+    _copy_sticker_tree(bundled, dest)
+    return dest if os.path.isdir(dest) else bundled
+
+
+def funkcijos_dir():
+    return os.path.join(stickers_dir(), "Funkcijos")
 
 
 def _as_pointf(point):
@@ -3652,11 +3681,11 @@ class WhiteboardWindow(QWidget):
         self.toolbar.eraser_mode_selected.connect(self._on_eraser_mode)
         self.toolbar.sticker_requested.connect(
             lambda: self._open_sticker_dialog(
-                STICKERS_DIR, "Pasirinkite figūrą", max_size=FIGURE_MAX_SIZE
+                stickers_dir(), "Pasirinkite figūrą", max_size=FIGURE_MAX_SIZE
             )
         )
         self.toolbar.funkcijos_requested.connect(
-            lambda: self._open_sticker_dialog(FUNKCIJOS_DIR, "Pasirinkite funkciją")
+            lambda: self._open_sticker_dialog(funkcijos_dir(), "Pasirinkite funkciją")
         )
         self.toolbar.collab_toggled.connect(self._on_collab_toggled)
         self.toolbar.capture_pause_toggled.connect(self._on_capture_pause_toggled)
