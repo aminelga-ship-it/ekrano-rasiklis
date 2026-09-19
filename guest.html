@@ -1,0 +1,494 @@
+<!DOCTYPE html>
+<html lang="lt">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <title>Bendras pieštukas</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      height: 100%;
+      overflow: hidden;
+      font-family: Segoe UI, Arial, sans-serif;
+      background: #ececec;
+      color: #222;
+      touch-action: none;
+    }
+    header {
+      height: 56px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 0 14px;
+      background: #f4f4f4;
+      border-bottom: 1px solid #d0d0d0;
+    }
+    .status {
+      font-size: 14px;
+      line-height: 1.3;
+    }
+    .status strong { display: block; }
+    .hint { color: #666; font-size: 12px; }
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: #c62828;
+      flex: 0 0 auto;
+    }
+    .dot.on { background: #2e7d32; }
+    .tools { display: flex; gap: 6px; flex: 0 0 auto; }
+    .tools button {
+      border: 1px solid #c8c8c8;
+      background: #fff;
+      border-radius: 6px;
+      padding: 6px 10px;
+      font-size: 13px;
+      cursor: pointer;
+    }
+    .tools button.active { background: #d6e8ff; border-color: #7eb6ff; }
+    .tools button:disabled { opacity: 0.45; cursor: not-allowed; }
+    canvas {
+      display: block;
+      width: 100%;
+      height: calc(100% - 56px);
+      background: #fff;
+      cursor: crosshair;
+    }
+    canvas.blocked { cursor: not-allowed; }
+    canvas.erasing { cursor: cell; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="status">
+      <strong id="title">Jungiamasi...</strong>
+      <span class="hint" id="hint">Matote vedėjo piešinius, figūras ir tekstą realiu laiku.</span>
+    </div>
+    <div class="tools">
+      <button id="penBtn" class="active" type="button">Pieštukas</button>
+      <button id="eraserBtn" type="button">Trintukas</button>
+      <button id="undoBtn" type="button">Atšaukti</button>
+    </div>
+    <div class="dot" id="dot"></div>
+  </header>
+  <canvas id="board"></canvas>
+  <script>
+    const canvas = document.getElementById("board");
+    const ctx = canvas.getContext("2d");
+    const title = document.getElementById("title");
+    const hint = document.getElementById("hint");
+    const dot = document.getElementById("dot");
+
+    const token = new URLSearchParams(location.search).get("k") || "";
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    const wsUrl = proto + "//" + location.host + "/?k=" + encodeURIComponent(token);
+
+    let allowed = false;
+    let connected = false;
+    let tool = "pen";
+    let state = { viewW: 1, viewH: 1, offsetX: 0, offsetY: 0, canvasW: 1, canvasH: 1, strokes: [], images: [], texts: [] };
+    const imageCache = {};
+    const live = {};
+    let localId = null;
+    let drawing = false;
+    let socket = null;
+    const penBtn = document.getElementById("penBtn");
+    const eraserBtn = document.getElementById("eraserBtn");
+    const undoBtn = document.getElementById("undoBtn");
+    const ERASER_WIDTH = 24;
+    let pendingPts = [];
+    let flushScheduled = false;
+    let eraseScheduled = false;
+    let pendingErase = null;
+
+    function setStatus(main, extra, ok) {
+      title.textContent = main;
+      hint.textContent = extra || "";
+      dot.classList.toggle("on", !!ok);
+      canvas.classList.toggle("blocked", !allowed);
+      canvas.classList.toggle("erasing", allowed && tool === "eraser");
+      penBtn.disabled = !allowed;
+      eraserBtn.disabled = !allowed;
+      undoBtn.disabled = !allowed;
+    }
+
+    function setTool(next) {
+      tool = next;
+      penBtn.classList.toggle("active", tool === "pen");
+      eraserBtn.classList.toggle("active", tool === "eraser");
+      canvas.classList.toggle("erasing", allowed && tool === "eraser");
+    }
+
+    function nearStroke(stroke, nx, ny) {
+      const points = stroke.points || [];
+      const limit = ERASER_WIDTH * ERASER_WIDTH;
+      for (let i = 0; i < points.length; i++) {
+        const dx = (points[i][0] - nx) * state.canvasW;
+        const dy = (points[i][1] - ny) * state.canvasH;
+        if (dx * dx + dy * dy <= limit) return true;
+      }
+      return false;
+    }
+
+    function eraseLocal(nx, ny) {
+      state.strokes = (state.strokes || []).filter(function (stroke) {
+        return !nearStroke(stroke, nx, ny);
+      });
+      Object.keys(live).forEach(function (id) {
+        if (nearStroke(live[id], nx, ny)) delete live[id];
+      });
+      redraw();
+    }
+
+    function undoLocal() {
+      if (localId && live[localId]) {
+        delete live[localId];
+        localId = null;
+        drawing = false;
+        redraw();
+        return;
+      }
+      const keys = Object.keys(live);
+      if (keys.length) {
+        delete live[keys[keys.length - 1]];
+        redraw();
+        return;
+      }
+      if (state.strokes && state.strokes.length) {
+        state.strokes.pop();
+        redraw();
+      }
+    }
+
+    function resize() {
+      const ratio = window.devicePixelRatio || 1;
+      const w = canvas.clientWidth;
+      const h = canvas.clientHeight;
+      canvas.width = Math.max(1, Math.floor(w * ratio));
+      canvas.height = Math.max(1, Math.floor(h * ratio));
+      ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+      ctx.imageSmoothingEnabled = true;
+      if ("imageSmoothingQuality" in ctx) ctx.imageSmoothingQuality = "high";
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      ctx.miterLimit = 1;
+      redraw();
+    }
+
+    function toView(nx, ny) {
+      const cx = nx * state.canvasW;
+      const cy = ny * state.canvasH;
+      const x = ((cx - state.offsetX) / state.viewW) * canvas.clientWidth;
+      const y = ((cy - state.offsetY) / state.viewH) * canvas.clientHeight;
+      return [x, y];
+    }
+
+    function fromView(x, y) {
+      const cx = (x / canvas.clientWidth) * state.viewW + state.offsetX;
+      const cy = (y / canvas.clientHeight) * state.viewH + state.offsetY;
+      return [cx / state.canvasW, cy / state.canvasH];
+    }
+
+    function getCachedImage(data) {
+      if (!data) return null;
+      if (!imageCache[data]) {
+        const img = new Image();
+        imageCache[data] = img;
+        img.onload = function () { redraw(); };
+        img.src = "data:image/png;base64," + data;
+      }
+      return imageCache[data];
+    }
+
+    function drawImage(image) {
+      const img = getCachedImage(image.data);
+      if (!img || !img.complete || !img.naturalWidth) return;
+      const tl = toView(image.x, image.y);
+      const br = toView(image.x + image.w, image.y + image.h);
+      ctx.drawImage(img, tl[0], tl[1], br[0] - tl[0], br[1] - tl[1]);
+    }
+
+    function drawTextItem(textItem) {
+      const p = toView(textItem.x, textItem.y);
+      ctx.fillStyle = textItem.color || "#000";
+      ctx.font = "16px Arial, sans-serif";
+      ctx.textBaseline = "top";
+      if ("textRendering" in ctx) ctx.textRendering = "geometricPrecision";
+      ctx.fillText(textItem.text || "", p[0], p[1]);
+    }
+
+    function viewPoints(points) {
+      const pts = [];
+      for (let i = 0; i < points.length; i++) {
+        pts.push(toView(points[i][0], points[i][1]));
+      }
+      return pts;
+    }
+
+    function drawStroke(stroke) {
+      const points = stroke.points || [];
+      if (!points.length) return;
+      ctx.strokeStyle = stroke.color || "#000";
+      ctx.fillStyle = stroke.color || "#000";
+      ctx.lineWidth = 4;
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      const pts = viewPoints(points);
+      ctx.beginPath();
+      if (pts.length === 1) {
+        ctx.arc(pts[0][0], pts[0][1], 2, 0, Math.PI * 2);
+        ctx.fill();
+        return;
+      }
+      ctx.moveTo(pts[0][0], pts[0][1]);
+      if (pts.length === 2) {
+        ctx.lineTo(pts[1][0], pts[1][1]);
+      } else {
+        for (let i = 0; i < pts.length - 1; i++) {
+          const p0 = pts[i === 0 ? i : i - 1];
+          const p1 = pts[i];
+          const p2 = pts[i + 1];
+          const p3 = pts[i + 2 < pts.length ? i + 2 : i + 1];
+          ctx.bezierCurveTo(
+            p1[0] + (p2[0] - p0[0]) / 6,
+            p1[1] + (p2[1] - p0[1]) / 6,
+            p2[0] - (p3[0] - p1[0]) / 6,
+            p2[1] - (p3[1] - p1[1]) / 6,
+            p2[0],
+            p2[1]
+          );
+        }
+      }
+      ctx.stroke();
+    }
+
+    function redraw() {
+      ctx.clearRect(0, 0, canvas.clientWidth, canvas.clientHeight);
+      (state.images || []).forEach(drawImage);
+      (state.texts || []).forEach(drawTextItem);
+      (state.strokes || []).forEach(drawStroke);
+      Object.keys(live).forEach(function (id) { drawStroke(live[id]); });
+    }
+
+    function schedulePointFlush() {
+      if (flushScheduled) return;
+      flushScheduled = true;
+      requestAnimationFrame(function () {
+        flushScheduled = false;
+        if (!localId || !pendingPts.length) return;
+        send({ type: "stroke_points", id: localId, pts: pendingPts });
+        pendingPts = [];
+      });
+    }
+
+    function scheduleEraseSend(nx, ny) {
+      pendingErase = [nx, ny];
+      if (eraseScheduled) return;
+      eraseScheduled = true;
+      setTimeout(function () {
+        eraseScheduled = false;
+        if (!pendingErase) return;
+        send({ type: "erase", x: pendingErase[0], y: pendingErase[1] });
+        pendingErase = null;
+      }, 32);
+    }
+
+    function send(msg) {
+      if (socket && socket.readyState === 1) {
+        socket.send(JSON.stringify(msg));
+      }
+    }
+
+    function updatePermissionStatus() {
+      if (!connected) {
+        setStatus("Jungiamasi...", "Laukiama ryšio su vedėjo lenta.", false);
+        return;
+      }
+      if (allowed) {
+        setStatus("Galite rašyti ir trinti", "Pieštukas, trintukas arba Atšaukti (Ctrl+Z).", true);
+      } else {
+        setStatus("Laukiama leidimo", "Vedėjas dar neįjungė jūsų pieštuko.", false);
+      }
+    }
+
+    function onMessage(event) {
+      let msg;
+      try { msg = JSON.parse(event.data); } catch (e) { return; }
+      if (msg.type === "hello") {
+        allowed = !!msg.allowed;
+        if (msg.state) state = Object.assign({}, state, msg.state);
+        Object.keys(live).forEach(function (k) { delete live[k]; });
+        updatePermissionStatus();
+        redraw();
+        return;
+      }
+      if (msg.type === "permission") {
+        allowed = !!msg.allowed;
+        updatePermissionStatus();
+        if (!allowed) {
+          drawing = false;
+          localId = null;
+        }
+        return;
+      }
+      if (msg.type === "state") {
+        state = Object.assign({}, state, msg.state || msg);
+        redraw();
+        return;
+      }
+      if (msg.type === "stroke_start") {
+        live[msg.id] = { color: msg.color || "#1565c0", points: [[msg.x, msg.y]] };
+        redraw();
+        return;
+      }
+      if (msg.type === "stroke_point" && live[msg.id]) {
+        live[msg.id].points.push([msg.x, msg.y]);
+        redraw();
+        return;
+      }
+      if (msg.type === "stroke_points") {
+        if (!live[msg.id]) {
+          live[msg.id] = { color: msg.color || "#000000", points: [] };
+        }
+        const pts = msg.pts || [];
+        for (let i = 0; i < pts.length; i++) {
+          live[msg.id].points.push(pts[i]);
+        }
+        redraw();
+        return;
+      }
+      if (msg.type === "stroke_end") {
+        if (live[msg.id]) {
+          state.strokes = (state.strokes || []).concat([live[msg.id]]);
+          delete live[msg.id];
+          redraw();
+        }
+        return;
+      }
+      if (msg.type === "erase") {
+        eraseLocal(msg.x, msg.y);
+        return;
+      }
+      if (msg.type === "clear") {
+        state.strokes = [];
+        state.images = [];
+        state.texts = [];
+        Object.keys(live).forEach(function (k) { delete live[k]; });
+        localId = null;
+        drawing = false;
+        pendingPts = [];
+        redraw();
+      }
+    }
+
+    function pointerPos(ev) {
+      const rect = canvas.getBoundingClientRect();
+      return [ev.clientX - rect.left, ev.clientY - rect.top];
+    }
+
+    canvas.addEventListener("pointerdown", function (ev) {
+      if (!allowed || ev.button === 2) return;
+      ev.preventDefault();
+      canvas.setPointerCapture(ev.pointerId);
+      const p = pointerPos(ev);
+      const n = fromView(p[0], p[1]);
+      if (tool === "eraser") {
+        drawing = true;
+        eraseLocal(n[0], n[1]);
+        scheduleEraseSend(n[0], n[1]);
+        return;
+      }
+      drawing = true;
+      localId = "g-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
+      live[localId] = { color: "#1565c0", points: [n] };
+      send({ type: "stroke_start", id: localId, color: "#1565c0", x: n[0], y: n[1] });
+      redraw();
+    });
+
+    canvas.addEventListener("pointermove", function (ev) {
+      if (!drawing || !allowed) return;
+      ev.preventDefault();
+      const p = pointerPos(ev);
+      const n = fromView(p[0], p[1]);
+      if (tool === "eraser") {
+        eraseLocal(n[0], n[1]);
+        scheduleEraseSend(n[0], n[1]);
+        return;
+      }
+      if (!localId) return;
+      const pts = live[localId].points;
+      const last = pts[pts.length - 1];
+      const dx = (n[0] - last[0]) * state.canvasW;
+      const dy = (n[1] - last[1]) * state.canvasH;
+      if (dx * dx + dy * dy < 0.64) return;
+      pts.push(n);
+      pendingPts.push(n);
+      schedulePointFlush();
+      redraw();
+    });
+
+    function endStroke(ev) {
+      if (!drawing) return;
+      drawing = false;
+      if (tool === "pen" && localId) {
+        if (pendingPts.length) {
+          send({ type: "stroke_points", id: localId, pts: pendingPts });
+          pendingPts = [];
+        }
+        send({ type: "stroke_end", id: localId });
+        if (live[localId]) {
+          state.strokes = (state.strokes || []).concat([live[localId]]);
+          delete live[localId];
+        }
+        localId = null;
+      }
+      if (ev) {
+        try { canvas.releasePointerCapture(ev.pointerId); } catch (e) {}
+      }
+      redraw();
+    }
+
+    function requestUndo() {
+      if (!allowed) return;
+      undoLocal();
+      send({ type: "undo" });
+    }
+
+    canvas.addEventListener("pointerup", endStroke);
+    canvas.addEventListener("pointercancel", endStroke);
+
+    function connect() {
+      setStatus("Jungiamasi...", "Laukiama ryšio su vedėjo lenta.", false);
+      socket = new WebSocket(wsUrl);
+      socket.onopen = function () {
+        connected = true;
+        updatePermissionStatus();
+      };
+      socket.onmessage = onMessage;
+      socket.onclose = function () {
+        connected = false;
+        allowed = false;
+        setStatus("Ryšys nutrūko", "Palaukite arba paprašykite vedėjo iš naujo atsiųsti nuorodą.", false);
+        setTimeout(connect, 1500);
+      };
+      socket.onerror = function () {};
+    }
+
+    penBtn.addEventListener("click", function () { setTool("pen"); });
+    eraserBtn.addEventListener("click", function () { setTool("eraser"); });
+    undoBtn.addEventListener("click", requestUndo);
+    window.addEventListener("keydown", function (ev) {
+      if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "z") {
+        ev.preventDefault();
+        requestUndo();
+      }
+    });
+    window.addEventListener("resize", resize);
+    resize();
+    connect();
+  </script>
+</body>
+</html>

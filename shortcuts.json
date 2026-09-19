@@ -1,0 +1,98 @@
+{
+  "color_black": {
+    "key": 75,
+    "mods": 0
+  },
+  "color_blue": {
+    "key": 66,
+    "mods": 0
+  },
+  "color_red": {
+    "key": 82,
+    "mods": 0
+  },
+  "color_green": {
+    "key": 71,
+    "mods": 0
+  },
+  "tool_eraser": {
+    "key": 69,
+    "mods": 0
+  },
+  "tool_text": {
+    "key": 84,
+    "mods": 0
+  },
+  "undo": {
+    "key": 90,
+    "mods": 67108864
+  },
+  "paste": {
+    "key": 86,
+    "mods": 67108864
+  },
+  "delete": {
+    "key": 16777223,
+    "mods": 0
+  },
+  "brush_thicker": {
+    "key": 43,
+    "mods": 67108864
+  },
+  "brush_thinner": {
+    "key": 45,
+    "mods": 67108864
+  },
+  "scale_up": {
+    "key": 43,
+    "mods": 0
+  },
+  "scale_down": {
+    "key": 45,
+    "mods": 0
+  },
+  "overlay_zoom": {
+    "key": 43,
+    "mods": 0
+  },
+  "overlay_mouse": {
+    "key": 32,
+    "mods": 0
+  },
+  "close_whiteboard": {
+    "key": 16777216,
+    "mods": 0
+  },
+  "overlay_escape": {
+    "key": 16777216,
+    "mods": 0
+  },
+  "hold_line": {
+    "key": 16777248,
+    "mods": 0
+  },
+  "hold_rect": {
+    "key": 16777249,
+    "mods": 0
+  },
+  "hold_circle": {
+    "key": 81,
+    "mods": 0
+  },
+  "hold_triangle": {
+    "key": 65,
+    "mods": 0
+  },
+  "open_whiteboard": {
+    "combo": [
+      "*",
+      "-"
+    ]
+  },
+  "open_overlay": {
+    "combo": [
+      "*",
+      "/"
+    ]
+  }
+}
