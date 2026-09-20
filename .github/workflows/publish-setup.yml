@@ -22,9 +22,9 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.0.4
-          name: Ekrano rašiklis 1.0.4
-          body: Windows Setup su figūromis ir funkcijų grafikais.
+          tag_name: v1.0.5
+          name: Ekrano rašiklis 1.0.5
+          body: Windows Setup su atminties ir piešimo optimizacijomis.
           files: EkranoRasiklis-Setup.exe
           fail_on_unmatched_files: true
           make_latest: true

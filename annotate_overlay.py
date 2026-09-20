@@ -335,6 +335,46 @@ def _item_hit(item, pos, radius):
     return False
 
 
+def _item_bounds(item):
+    kind = item.get("type")
+    pad = float(item.get("width", PEN_WIDTH)) * 0.5 + 6.0
+    if kind == "stroke":
+        points = item.get("points") or []
+        if not points:
+            return QRect()
+        xs = [float(p.x()) for p in points]
+        ys = [float(p.y()) for p in points]
+        rect = QRectF(min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys))
+    elif kind in ("line", "arrow"):
+        rect = QRectF(_as_pointf(item["p1"]), _as_pointf(item["p2"])).normalized()
+        if kind == "arrow":
+            head = _arrow_head(item["p1"], item["p2"])
+            if not head.isEmpty():
+                rect = rect.united(head.boundingRect())
+    elif kind in ("square", "rect"):
+        rect = QRectF(item["rect"])
+    elif kind == "circle":
+        center = item["center"]
+        radius = float(item["radius"])
+        rect = QRectF(center.x() - radius, center.y() - radius, radius * 2.0, radius * 2.0)
+    elif kind == "triangle":
+        pts = item.get("points") or []
+        if len(pts) < 3:
+            return QRect()
+        rect = QPolygonF(pts).boundingRect()
+    elif kind == "text":
+        rect = QRectF(item.get("rect") or QRectF())
+        pad = max(pad, 6.0)
+    else:
+        return QRect()
+    return rect.adjusted(-pad, -pad, pad, pad).toAlignedRect()
+
+
+def _point_bounds(pos, radius):
+    r = float(radius) + 4.0
+    return QRectF(float(pos.x()) - r, float(pos.y()) - r, r * 2.0, r * 2.0).toAlignedRect()
+
+
 def _pen_for(color, width=PEN_WIDTH):
     pen = QPen(color, width, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
     pen.setCosmetic(False)
@@ -892,6 +932,7 @@ class AnnotateOverlay(QWidget):
         self._text_ignore_focus = False
         self._undo_stack = []
         self._erase_snapshot = None
+        self._eraser_preview_pos = None
         self._hold_timer = QTimer(self)
         self._hold_timer.setInterval(32)
         self._hold_timer.timeout.connect(self._poll_hold_keys)
@@ -908,19 +949,16 @@ class AnnotateOverlay(QWidget):
         self._update_cursor()
         self._menu = OverlayMenu()
         self._menu.action.connect(self._on_menu_action)
-        self._menu.toggled.connect(lambda: QTimer.singleShot(0, self._restore_keyboard))
+        self._menu.toggled.connect(self._on_menu_toggled)
         self._menu.place_on(self)
         self._menu.show()
         self._raise_menu()
         self._sync_menu()
-        self._menu_top_timer = QTimer(self)
-        self._menu_top_timer.setInterval(300)
-        self._menu_top_timer.timeout.connect(self._raise_menu)
-        self._menu_top_timer.start()
         QTimer.singleShot(0, self._ensure_input)
         app = QApplication.instance()
         if app is not None:
             app.installEventFilter(self)
+            app.applicationStateChanged.connect(self._on_app_state)
 
     def _ensure_input(self):
         if self._closing or self._mouse_mode:
@@ -942,6 +980,52 @@ class AnnotateOverlay(QWidget):
                 _force_topmost(int(menu.winId()), activate=False)
         except RuntimeError:
             self._menu = None
+
+    def _on_menu_toggled(self):
+        QTimer.singleShot(0, self._restore_keyboard)
+        self._raise_menu()
+
+    def _on_app_state(self, state):
+        if self._closing or not self.isVisible():
+            return
+        if state == Qt.ApplicationActive:
+            self._raise_menu()
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.ActivationChange and self.isActiveWindow() and not self._closing:
+            self._raise_menu()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._raise_menu()
+
+    def _canvas_rect_to_view(self, rect):
+        r = QRectF(rect)
+        if self._zoom_active:
+            r = QRectF(
+                (r.x() - self._zoom_x) * ZOOM_SCALE,
+                (r.y() - self._zoom_y) * ZOOM_SCALE,
+                r.width() * ZOOM_SCALE,
+                r.height() * ZOOM_SCALE,
+            )
+        return r.toAlignedRect().adjusted(-2, -2, 2, 2)
+
+    def _union_item_bounds(self, items):
+        bounds = QRect()
+        for item in items:
+            bounds = bounds.united(_item_bounds(item))
+        return bounds
+
+    def _update_region(self, rect=None):
+        if rect is None or (self._zoom_active and not self._zoom_locked):
+            self.update()
+            return
+        view = self._canvas_rect_to_view(rect)
+        view = view.intersected(self.rect())
+        if view.isEmpty():
+            return
+        self.update(view)
 
     def _menu_state(self):
         color_id = "color_black"
@@ -1209,7 +1293,8 @@ class AnnotateOverlay(QWidget):
         prev_caps = self._caps_held
         self._sync_shape_hold_keys()
         if self._q_is_held() != prev_q or self._caps_held != prev_caps:
-            self.update()
+            if self._drawing and self._current is not None:
+                self._update_region(_item_bounds(self._current))
 
     def _shape_from_modifiers(self, drawing=False):
         self._sync_shape_hold_keys()
@@ -1441,8 +1526,8 @@ class AnnotateOverlay(QWidget):
                             self._caps_held = hold_down("hold_triangle")
                     else:
                         self._sync_shape_hold_keys()
-                    if self._drawing:
-                        self.update()
+                    if self._drawing and self._current is not None:
+                        self._update_region(_item_bounds(self._current))
         return super().eventFilter(obj, event)
 
     def event(self, event):
@@ -1462,19 +1547,38 @@ class AnnotateOverlay(QWidget):
         return False
 
     def _erase_at(self, pos):
-        remaining = [item for item in self.items if not _item_hit(item, pos, self.eraser_width)]
-        if len(remaining) != len(self.items):
+        radius = float(self.eraser_width)
+        dirty = _point_bounds(pos, radius + 3.0)
+        old_preview = self._eraser_preview_pos
+        self._eraser_preview_pos = pos
+        if old_preview is not None:
+            dirty = dirty.united(_point_bounds(old_preview, radius + 3.0))
+        remaining = []
+        changed = False
+        for item in self.items:
+            if _item_hit(item, pos, radius):
+                dirty = dirty.united(_item_bounds(item))
+                changed = True
+                continue
+            remaining.append(item)
+        if changed:
             self.items = remaining
-            self.update()
+        self._update_region(dirty)
 
     def _undo(self):
         if self._drawing:
+            bounds = QRect()
+            if self._current is not None:
+                bounds = bounds.united(_item_bounds(self._current))
+            if self._erase_snapshot is not None:
+                bounds = bounds.united(self._union_item_bounds(self._erase_snapshot))
+                bounds = bounds.united(self._union_item_bounds(self.items))
             self._drawing = False
             self._current = None
             if self._erase_snapshot is not None:
                 self.items = self._erase_snapshot
                 self._erase_snapshot = None
-            self.update()
+            self._update_region(bounds or None)
             return
         if self._text_editor is not None:
             self._finish_text(False)
@@ -1487,9 +1591,15 @@ class AnnotateOverlay(QWidget):
         action, payload = self._undo_stack.pop()
         if action == "add":
             if payload in self.items:
+                bounds = _item_bounds(payload)
                 self.items.remove(payload)
+                self._update_region(bounds)
+                return
         elif action == "restore":
+            bounds = self._union_item_bounds(self.items)
             self.items = list(payload)
+            self._update_region(bounds.united(self._union_item_bounds(self.items)))
+            return
         self.update()
 
     def _begin_item(self, pos):
@@ -1543,6 +1653,8 @@ class AnnotateOverlay(QWidget):
                 "points": _triangle_from_rect(QRectF(pos, pos)),
                 "_origin": pos,
             }
+        if self._current is not None:
+            self._update_region(_item_bounds(self._current))
 
     def _update_item(self, pos):
         if not self._drawing:
@@ -1555,8 +1667,20 @@ class AnnotateOverlay(QWidget):
             return
         kind = current["type"]
         if kind == "stroke":
-            _append_point(current["points"], pos)
-        elif kind in ("line", "arrow"):
+            points = current["points"]
+            last_pts = points[-4:] if points else []
+            if not _append_point(points, pos):
+                return
+            pts = last_pts + [points[-1]]
+            pad = float(current.get("width", self.pen_width)) * 0.5 + 8.0
+            xs = [float(p.x()) for p in pts]
+            ys = [float(p.y()) for p in pts]
+            self._update_region(
+                QRectF(min(xs) - pad, min(ys) - pad, max(xs) - min(xs) + 2.0 * pad, max(ys) - min(ys) + 2.0 * pad)
+            )
+            return
+        old_bounds = _item_bounds(current)
+        if kind in ("line", "arrow"):
             current["p2"] = pos
         elif kind in ("square", "rect"):
             current["rect"] = _drag_rect(current["_origin"], pos)
@@ -1566,7 +1690,7 @@ class AnnotateOverlay(QWidget):
             current["radius"] = radius
         elif kind == "triangle":
             current["points"] = _triangle_from_rect(QRectF(current["_origin"], pos))
-        self.update()
+        self._update_region(old_bounds.united(_item_bounds(current)))
 
     def _commit_item(self, pos):
         if not self._drawing:
@@ -1591,17 +1715,20 @@ class AnnotateOverlay(QWidget):
         if kind in ("square", "rect"):
             rect = current.get("rect")
             if rect is None or min(rect.width(), rect.height()) < 4:
+                self._update_region(_item_bounds(current))
                 return
         if kind in ("line", "arrow"):
             if math.hypot(current["p2"].x() - current["p1"].x(), current["p2"].y() - current["p1"].y()) < 6:
+                self._update_region(_item_bounds(current))
                 return
         if kind == "triangle":
             pts = current.get("points") or []
             if len(pts) < 3 or _dist2(pts[0], pts[1]) < 36:
+                self._update_region(_item_bounds(current))
                 return
         self.items.append(current)
         self._undo_stack.append(("add", current))
-        self.update()
+        self._update_region(_item_bounds(current))
 
     def _menu_contains_global(self, pos):
         menu = getattr(self, "_menu", None)
@@ -1633,11 +1760,17 @@ class AnnotateOverlay(QWidget):
             self._update_zoom_from_mouse(event.pos())
             self.update()
             return
+        canvas_pos = self._view_to_canvas(event.localPos())
         if self._drawing:
-            self._update_item(self._view_to_canvas(event.localPos()))
+            self._update_item(canvas_pos)
             return
         if self.tool == TOOL_ERASER:
-            self.update()
+            old = self._eraser_preview_pos
+            self._eraser_preview_pos = canvas_pos
+            dirty = _point_bounds(canvas_pos, self.eraser_width)
+            if old is not None:
+                dirty = dirty.united(_point_bounds(old, self.eraser_width))
+            self._update_region(dirty)
 
     def mouseReleaseEvent(self, event):
         if event.button() != Qt.LeftButton or self._mouse_mode:
@@ -1808,8 +1941,6 @@ class AnnotateOverlay(QWidget):
         self._closing = True
         if hasattr(self, "_hold_timer"):
             self._hold_timer.stop()
-        if hasattr(self, "_menu_top_timer"):
-            self._menu_top_timer.stop()
         menu = getattr(self, "_menu", None)
         if menu is not None:
             try:
@@ -1821,6 +1952,10 @@ class AnnotateOverlay(QWidget):
         app = QApplication.instance()
         if app is not None:
             app.removeEventFilter(self)
+            try:
+                app.applicationStateChanged.disconnect(self._on_app_state)
+            except TypeError:
+                pass
         self._finish_text(False)
         self.releaseKeyboard()
         self.items = []
@@ -1863,18 +1998,29 @@ class AnnotateOverlay(QWidget):
             painter.strokePath(path, QPen(QColor(255, 255, 255), 3, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
             painter.fillPath(path, color)
 
-    def paintEvent(self, _event):
+    def paintEvent(self, event):
         painter = QPainter(self)
         _configure_painter(painter)
+        dirty = event.rect()
+        painter.setClipRect(dirty)
         painter.setCompositionMode(QPainter.CompositionMode_Source)
         if self._mouse_mode:
-            painter.fillRect(self.rect(), QColor(0, 0, 0, 0))
+            painter.fillRect(dirty, QColor(0, 0, 0, 0))
         elif self._zoom_active:
-            painter.fillRect(self.rect(), QColor(0, 0, 0, 0))
+            painter.fillRect(dirty, QColor(0, 0, 0, 0))
         else:
             # Alpha 1 keeps the overlay clickable; fully transparent pixels pass clicks to Chrome.
-            painter.fillRect(self.rect(), QColor(0, 0, 0, 1))
+            painter.fillRect(dirty, QColor(0, 0, 0, 1))
         painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
+
+        def draw_visible_items():
+            for item in self.items:
+                if self._canvas_rect_to_view(_item_bounds(item)).intersects(dirty):
+                    self._draw_item(painter, item)
+            if self._current is not None:
+                if self._canvas_rect_to_view(_item_bounds(self._current)).intersects(dirty):
+                    self._draw_item(painter, self._current)
+            self._draw_eraser_preview(painter, dirty)
 
         if self._zoom_active and self._zoom_bg is not None:
             src_w, src_h = self._zoom_src_size()
@@ -1883,23 +2029,21 @@ class AnnotateOverlay(QWidget):
             painter.save()
             painter.scale(ZOOM_SCALE, ZOOM_SCALE)
             painter.translate(-self._zoom_x, -self._zoom_y)
-            for item in self.items:
-                self._draw_item(painter, item)
-            if self._current is not None:
-                self._draw_item(painter, self._current)
-            self._draw_eraser_preview(painter)
+            draw_visible_items()
             painter.restore()
         else:
-            for item in self.items:
-                self._draw_item(painter, item)
-            if self._current is not None:
-                self._draw_item(painter, self._current)
-            self._draw_eraser_preview(painter)
+            draw_visible_items()
 
-    def _draw_eraser_preview(self, painter):
+    def _draw_eraser_preview(self, painter, dirty=None):
         if self.tool != TOOL_ERASER or self._mouse_mode:
             return
-        pos = self._view_to_canvas(self.mapFromGlobal(QCursor.pos()))
+        pos = self._eraser_preview_pos
+        if pos is None:
+            pos = self._view_to_canvas(self.mapFromGlobal(QCursor.pos()))
+        if dirty is not None:
+            preview = self._canvas_rect_to_view(_point_bounds(pos, self.eraser_width))
+            if not preview.intersects(dirty):
+                return
         radius = float(self.eraser_width)
         painter.setPen(QPen(QColor(80, 80, 80, 200), 1.2))
         painter.setBrush(QColor(255, 255, 255, 40))

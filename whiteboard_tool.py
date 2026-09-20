@@ -477,8 +477,22 @@ def _raise_discord_popouts(exclude_hwnd=None):
 
 ICON_INK = QColor(70, 70, 72)
 ICON_STROKE = 1.35
-MAX_UNDO = 60
+MAX_UNDO = 10
+CANVAS_SCALE = 1.5
 MIN_ERASE_STEP = 3.5
+VECTOR_ERASE_TYPES = ("stroke", "text", "line", "arrow", "rect", "square", "circle", "triangle")
+
+
+def _capsule_bounds(p1, p2, radius):
+    r = float(radius)
+    x1, y1 = float(p1.x()), float(p1.y())
+    x2, y2 = float(p2.x()), float(p2.y())
+    return QRectF(
+        min(x1, x2) - r,
+        min(y1, y2) - r,
+        abs(x2 - x1) + 2.0 * r,
+        abs(y2 - y1) + 2.0 * r,
+    )
 
 
 def _make_icon(draw_fn, size=28):
@@ -1199,7 +1213,7 @@ class CanvasWidget(QWidget):
         super().resizeEvent(event)
         self._update_canvas_bounds()
         if not self._offset_initialized and self.width() > 0 and self.height() > 0:
-            self.offset = QPoint(self.width() // 2, self.height() // 2)
+            self.offset = QPoint(self._margin_x, self._margin_y)
             self._offset_initialized = True
             for item in self.items:
                 if item["type"] == "image" and item["pos"].x() == 0 and item["pos"].y() == 0:
@@ -1210,12 +1224,12 @@ class CanvasWidget(QWidget):
     def _update_canvas_bounds(self):
         w = max(1, self.width())
         h = max(1, self.height())
-        self._margin_x = w // 2
-        self._margin_y = h // 2
-        self._canvas_w = w + w
-        self._canvas_h = h + h
-        self.offset.setX(max(0, min(w, self.offset.x())))
-        self.offset.setY(max(0, min(h, self.offset.y())))
+        self._canvas_w = max(w, int(round(w * CANVAS_SCALE)))
+        self._canvas_h = max(h, int(round(h * CANVAS_SCALE)))
+        self._margin_x = (self._canvas_w - w) // 2
+        self._margin_y = (self._canvas_h - h) // 2
+        self.offset.setX(max(0, min(self._max_offset_x(), self.offset.x())))
+        self.offset.setY(max(0, min(self._max_offset_y(), self.offset.y())))
 
     def _max_offset_x(self):
         return max(0, self._canvas_w - self.width())
@@ -2055,8 +2069,6 @@ class CanvasWidget(QWidget):
         if "pos" in cloned:
             pos = cloned["pos"]
             cloned["pos"] = QPointF(pos) if isinstance(pos, QPointF) else QPoint(pos)
-        if "pixmap" in cloned:
-            cloned["pixmap"] = QPixmap(cloned["pixmap"])
         if "points" in cloned:
             cloned["points"] = [QPointF(p) for p in cloned["points"]]
         if "p1" in cloned:
@@ -2069,6 +2081,7 @@ class CanvasWidget(QWidget):
             cloned["center"] = QPointF(cloned["center"])
         if "_origin" in cloned:
             cloned["_origin"] = QPointF(cloned["_origin"])
+        cloned.pop("_erase_raster", None)
         return cloned
 
     def _clone_canvas_state(self):
@@ -2105,6 +2118,7 @@ class CanvasWidget(QWidget):
         self._last_erase_pos = None
 
     def _commit_erase_undo(self):
+        self._flush_erase_rasters()
         if self._erase_snapshot is not None and self._erase_changed:
             self._push_restore_undo(self._erase_snapshot)
             self.content_changed.emit()
@@ -2287,6 +2301,7 @@ class CanvasWidget(QWidget):
             else:
                 self._erase_along(last, canvas_pos_f)
             self._last_erase_pos = QPointF(canvas_pos_f)
+            self.update()
             return
 
         if self._current_shape is not None:
@@ -2662,52 +2677,72 @@ class CanvasWidget(QWidget):
             "points": points,
         }
 
-    def _punch_circle_image(self, item, canvas_pos, radius):
-        img_rect = QRectF(self._image_rect(item))
-        if not img_rect.adjusted(-radius, -radius, radius, radius).contains(_as_pointf(canvas_pos)):
-            return False
-        pixmap = item["pixmap"]
-        if pixmap.isNull():
-            return False
-        scale = item["scale"] if item["scale"] else 1.0
-        ix = (float(canvas_pos.x()) - float(item["pos"].x())) / scale
-        iy = (float(canvas_pos.y()) - float(item["pos"].y())) / scale
-        ir = float(radius) / scale
-        painter = QPainter(pixmap)
-        if not painter.isActive():
-            image = pixmap.toImage().convertToFormat(QImage.Format_ARGB32)
-            painter = QPainter(image)
-            painter.setRenderHint(QPainter.Antialiasing, True)
-            painter.setCompositionMode(QPainter.CompositionMode_Source)
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QColor(0, 0, 0, 0))
-            painter.drawEllipse(QPointF(ix, iy), ir, ir)
-            painter.end()
-            item["pixmap"] = QPixmap.fromImage(image)
-            return True
+    def _flush_erase_rasters(self):
+        for item in self.items:
+            raster = item.pop("_erase_raster", None)
+            if raster is not None:
+                item["pixmap"] = QPixmap.fromImage(raster)
+
+    def _paint_erase_capsule(self, painter, p1, p2, radius, clear=False):
+        p1 = _as_pointf(p1)
+        p2 = _as_pointf(p2)
         painter.setRenderHint(QPainter.Antialiasing, True)
-        painter.setCompositionMode(QPainter.CompositionMode_Source)
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor(0, 0, 0, 0))
-        painter.drawEllipse(QPointF(ix, iy), ir, ir)
+        if clear:
+            painter.setCompositionMode(QPainter.CompositionMode_Clear)
+            color = QColor(0, 0, 0, 0)
+        else:
+            painter.setCompositionMode(QPainter.CompositionMode_Source)
+            color = QColor(255, 255, 255, 255)
+        dist = math.hypot(p2.x() - p1.x(), p2.y() - p1.y())
+        if dist < 0.5:
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(color)
+            painter.drawEllipse(p1, radius, radius)
+            return
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(color, radius * 2.0, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        painter.drawLine(p1, p2)
+
+    def _punch_erase_on_image_item(self, item, p1, p2, radius):
+        img_rect = QRectF(self._image_rect(item))
+        cap = _capsule_bounds(p1, p2, radius)
+        if not img_rect.intersects(cap):
+            return False
+        raster = item.get("_erase_raster")
+        if raster is None:
+            pixmap = item["pixmap"]
+            if pixmap.isNull():
+                return False
+            raster = pixmap.toImage().convertToFormat(QImage.Format_ARGB32_Premultiplied)
+            item["_erase_raster"] = raster
+        scale = float(item["scale"] if item["scale"] else 1.0) or 1.0
+        ox = float(item["pos"].x())
+        oy = float(item["pos"].y())
+
+        def to_img(point):
+            return QPointF((float(point.x()) - ox) / scale, (float(point.y()) - oy) / scale)
+
+        painter = QPainter(raster)
+        if not painter.isActive():
+            return False
+        self._paint_erase_capsule(painter, to_img(p1), to_img(p2), float(radius) / scale, clear=True)
         painter.end()
         return True
 
-    def _stamp_erase_cache(self, canvas_pos, radius):
+    def _stamp_erase_cache_segment(self, p1, p2, radius):
         if self._static_cache is None or self._cache_dirty:
             self._rebuild_cache()
         if self._static_cache is None:
             return
         painter = QPainter(self._static_cache)
-        painter.setRenderHint(QPainter.Antialiasing, True)
         painter.scale(self._cache_dpr, self._cache_dpr)
-        painter.setCompositionMode(QPainter.CompositionMode_Source)
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor(255, 255, 255, 255))
-        painter.drawEllipse(_as_pointf(canvas_pos), radius, radius)
+        self._paint_erase_capsule(painter, p1, p2, radius, clear=False)
         painter.end()
 
     def _erase_along(self, start, end):
+        if self.eraser_mode == ERASER_PIXEL:
+            self._erase_pixels_segment(start, end)
+            return
         x1, y1 = float(start.x()), float(start.y())
         x2, y2 = float(end.x()), float(end.y())
         dist = math.hypot(x2 - x1, y2 - y1)
@@ -2723,7 +2758,7 @@ class CanvasWidget(QWidget):
         if mode is None:
             mode = self.eraser_mode
         if mode == ERASER_PIXEL:
-            self._erase_pixels_at(canvas_pos)
+            self._erase_pixels_segment(canvas_pos, canvas_pos)
         else:
             self._erase_object_at(canvas_pos)
 
@@ -2775,96 +2810,62 @@ class CanvasWidget(QWidget):
             if self._erase_snapshot is None:
                 self.content_changed.emit()
 
-    def _erase_pixels_at(self, canvas_pos):
+    def _erase_pixels_segment(self, start, end):
         radius = float(self.eraser_width)
+        cap = _capsule_bounds(start, end, radius)
         changed = False
         remaining = []
 
-        def maybe_bake(item):
+        def bake_if_hit(item):
+            nonlocal changed
             bounds = self._vector_bounds(item)
             if bounds is None:
-                return None
-            if bounds.width() > 1400 or bounds.height() > 1400:
-                return None
-            return self._bake_item_to_image(item)
-
-        def append_stroke_frags(item, points_key="points"):
-            nonlocal changed
-            hit_r = radius + self._item_width(item) * 0.5
-            if not _item_hit(item, canvas_pos, hit_r):
                 remaining.append(item)
                 return
-            baked = maybe_bake(item)
-            if baked is not None:
-                self._punch_circle_image(baked, canvas_pos, radius)
-                remaining.append(baked)
+            pad = radius + self._item_width(item) * 0.5
+            if not bounds.adjusted(-pad, -pad, pad, pad).intersects(cap):
+                remaining.append(item)
+                return
+            baked = self._bake_item_to_image(item)
+            if baked is None:
                 changed = True
-                if item is self.selected_item:
-                    self.selected_item = baked
                 return
-            fragments = self._clip_stroke_outside_circle(item[points_key], canvas_pos, hit_r)
+            self._punch_erase_on_image_item(baked, start, end, radius)
+            remaining.append(baked)
             changed = True
-            if not fragments:
-                if item is self.selected_item:
-                    self.selected_item = None
-                return
-            item[points_key] = fragments[0]
-            remaining.append(item)
-            for extra in fragments[1:]:
-                remaining.append(self._copy_stroke(item, extra))
+            if item is self.selected_item:
+                self.selected_item = baked
 
         for item in self.items:
             kind = item["type"]
             if kind == "image":
-                if self._punch_circle_image(item, canvas_pos, radius):
+                if self._punch_erase_on_image_item(item, start, end, radius):
                     changed = True
                 remaining.append(item)
-            elif kind == "stroke":
-                append_stroke_frags(item)
-            elif kind == "text" or kind in ("line", "arrow", "rect", "square", "circle", "triangle"):
-                hit_r = radius + self._item_width(item) * 0.5
-                if kind == "text":
-                    hit = QRectF(self._text_rect(item)).adjusted(-radius, -radius, radius, radius).contains(
-                        _as_pointf(canvas_pos)
-                    )
-                else:
-                    hit = _item_hit(item, canvas_pos, hit_r)
-                if not hit:
-                    remaining.append(item)
-                    continue
-                baked = self._bake_item_to_image(item)
-                if baked is None:
-                    changed = True
-                    continue
-                self._punch_circle_image(baked, canvas_pos, radius)
-                remaining.append(baked)
-                changed = True
-                if item is self.selected_item:
-                    self.selected_item = baked
+            elif kind in VECTOR_ERASE_TYPES:
+                bake_if_hit(item)
             else:
                 remaining.append(item)
 
         live_remaining = {}
         for stroke_id, stroke in self._remote_strokes.items():
-            hit_r = radius + self._item_width(stroke) * 0.5
-            if not _item_hit(stroke, canvas_pos, hit_r):
+            bounds = self._vector_bounds(stroke)
+            pad = radius + self._item_width(stroke) * 0.5
+            if bounds is None or not bounds.adjusted(-pad, -pad, pad, pad).intersects(cap):
                 live_remaining[stroke_id] = stroke
                 continue
-            fragments = self._clip_stroke_outside_circle(stroke["points"], canvas_pos, hit_r)
+            baked = self._bake_item_to_image(stroke)
+            if baked is not None:
+                self._punch_erase_on_image_item(baked, start, end, radius)
+                remaining.append(baked)
             changed = True
-            if not fragments:
-                continue
-            stroke["points"] = fragments[0]
-            live_remaining[stroke_id] = stroke
-            for extra in fragments[1:]:
-                remaining.append(self._copy_stroke(stroke, extra))
         if live_remaining != self._remote_strokes:
             self._remote_strokes = live_remaining
 
         if changed:
             self._erase_changed = True
             self.items = remaining
-            self._stamp_erase_cache(canvas_pos, radius)
+            self._stamp_erase_cache_segment(start, end, radius)
             self.update()
 
     def _stroke_pen(self, color, width=None):
@@ -2924,6 +2925,7 @@ class CanvasWidget(QWidget):
         painter.drawEllipse(self._eraser_pos, radius, radius)
 
     def _rebuild_cache(self):
+        self._flush_erase_rasters()
         dpr = self._dpr()
         width = max(1, int(round(self._canvas_w * dpr)))
         height = max(1, int(round(self._canvas_h * dpr)))
