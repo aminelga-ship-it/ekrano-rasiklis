@@ -1,0 +1,30 @@
+name: Publish Setup
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/publish-setup.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout installer
+        uses: actions/checkout@v4
+        with:
+          ref: downloads
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.4
+          name: Ekrano rašiklis 1.0.4
+          body: Windows Setup su figūromis ir funkcijų grafikais.
+          files: EkranoRasiklis-Setup.exe
+          fail_on_unmatched_files: true
+          make_latest: true
