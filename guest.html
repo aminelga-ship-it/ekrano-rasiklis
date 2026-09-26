@@ -100,6 +100,7 @@
     const undoBtn = document.getElementById("undoBtn");
     const ERASER_WIDTH = 24;
     let pendingPts = [];
+    let stateRequested = false;
     let flushScheduled = false;
     let eraseScheduled = false;
     let pendingErase = null;
@@ -133,12 +134,23 @@
       return false;
     }
 
+    function isGuestStroke(stroke) {
+      return !!(stroke && stroke.author === "guest");
+    }
+
     function eraseLocal(nx, ny) {
       state.strokes = (state.strokes || []).filter(function (stroke) {
-        return !nearStroke(stroke, nx, ny);
+        return !(isGuestStroke(stroke) && nearStroke(stroke, nx, ny));
       });
       Object.keys(live).forEach(function (id) {
-        if (nearStroke(live[id], nx, ny)) delete live[id];
+        if (isGuestStroke(live[id]) && nearStroke(live[id], nx, ny)) {
+          if (id === localId) {
+            localId = null;
+            drawing = false;
+            pendingPts = [];
+          }
+          delete live[id];
+        }
       });
       redraw();
     }
@@ -148,18 +160,26 @@
         delete live[localId];
         localId = null;
         drawing = false;
+        pendingPts = [];
         redraw();
         return;
       }
       const keys = Object.keys(live);
-      if (keys.length) {
-        delete live[keys[keys.length - 1]];
-        redraw();
-        return;
+      for (let i = keys.length - 1; i >= 0; i--) {
+        if (isGuestStroke(live[keys[i]])) {
+          delete live[keys[i]];
+          redraw();
+          return;
+        }
       }
-      if (state.strokes && state.strokes.length) {
-        state.strokes.pop();
-        redraw();
+      const strokes = state.strokes || [];
+      for (let i = strokes.length - 1; i >= 0; i--) {
+        if (isGuestStroke(strokes[i])) {
+          strokes.splice(i, 1);
+          state.strokes = strokes;
+          redraw();
+          return;
+        }
       }
     }
 
@@ -187,9 +207,15 @@
     }
 
     function fromView(x, y) {
-      const cx = (x / canvas.clientWidth) * state.viewW + state.offsetX;
-      const cy = (y / canvas.clientHeight) * state.viewH + state.offsetY;
-      return [cx / state.canvasW, cy / state.canvasH];
+      const viewW = state.viewW > 2 ? state.viewW : (canvas.clientWidth || 1);
+      const viewH = state.viewH > 2 ? state.viewH : (canvas.clientHeight || 1);
+      const canvasW = state.canvasW > 2 ? state.canvasW : viewW;
+      const canvasH = state.canvasH > 2 ? state.canvasH : viewH;
+      const offsetX = state.canvasW > 2 ? state.offsetX : 0;
+      const offsetY = state.canvasH > 2 ? state.offsetY : 0;
+      const cx = (x / (canvas.clientWidth || 1)) * viewW + offsetX;
+      const cy = (y / (canvas.clientHeight || 1)) * viewH + offsetY;
+      return [cx / canvasW, cy / canvasH];
     }
 
     function getCachedImage(data) {
@@ -323,6 +349,10 @@
         Object.keys(live).forEach(function (k) { delete live[k]; });
         updatePermissionStatus();
         redraw();
+        if ((!(state.canvasW > 2) || !(state.viewW > 2)) && !stateRequested) {
+          stateRequested = true;
+          send({ type: "request_state" });
+        }
         return;
       }
       if (msg.type === "permission") {
@@ -340,7 +370,11 @@
         return;
       }
       if (msg.type === "stroke_start") {
-        live[msg.id] = { color: msg.color || "#1565c0", points: [[msg.x, msg.y]] };
+        live[msg.id] = {
+          color: msg.color || "#1565c0",
+          author: msg.author || "host",
+          points: [[msg.x, msg.y]],
+        };
         redraw();
         return;
       }
@@ -351,7 +385,11 @@
       }
       if (msg.type === "stroke_points") {
         if (!live[msg.id]) {
-          live[msg.id] = { color: msg.color || "#000000", points: [] };
+          live[msg.id] = {
+            color: msg.color || "#000000",
+            author: msg.author || "host",
+            points: [],
+          };
         }
         const pts = msg.pts || [];
         for (let i = 0; i < pts.length; i++) {
@@ -403,7 +441,7 @@
       }
       drawing = true;
       localId = "g-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
-      live[localId] = { color: "#1565c0", points: [n] };
+      live[localId] = { color: "#1565c0", author: "guest", points: [n] };
       send({ type: "stroke_start", id: localId, color: "#1565c0", x: n[0], y: n[1] });
       redraw();
     });
@@ -421,8 +459,10 @@
       if (!localId) return;
       const pts = live[localId].points;
       const last = pts[pts.length - 1];
-      const dx = (n[0] - last[0]) * state.canvasW;
-      const dy = (n[1] - last[1]) * state.canvasH;
+      const scaleX = state.canvasW > 2 ? state.canvasW : (canvas.clientWidth || 1);
+      const scaleY = state.canvasH > 2 ? state.canvasH : (canvas.clientHeight || 1);
+      const dx = (n[0] - last[0]) * scaleX;
+      const dy = (n[1] - last[1]) * scaleY;
       if (dx * dx + dy * dy < 0.64) return;
       pts.push(n);
       pendingPts.push(n);

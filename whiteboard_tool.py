@@ -251,11 +251,31 @@ EXPLORER_APP_CLASSES = {"CabinetWClass", "ExploreWClass"}
 WDA_NONE = 0x00000000
 WDA_EXCLUDEFROMCAPTURE = 0x00000011
 DWMWA_EXCLUDED_FROM_CAPTURE = 24
+DWMWA_CLOAKED = 14
+MONITOR_DEFAULTTONEAREST = 2
 DISCORD_EXES = {
     "discord.exe",
     "discordcanary.exe",
     "discordptb.exe",
     "discorddevelopment.exe",
+}
+# Compact call windows that are not already always-on-top (Teams, Zoom, Webex).
+# Browser picture-in-picture (Meet / Classroom) is already topmost and is picked
+# up with every other floating camera window.
+MEETING_POPOUT_EXES = {
+    "ms-teams.exe",
+    "teams.exe",
+    "msteams.exe",
+    "zoom.exe",
+    "cpthost.exe",
+    "ciscocollabhost.exe",
+    "webexhost.exe",
+    "atmgr.exe",
+    "skype.exe",
+}
+FLOAT_IGNORE_EXES = {
+    "widgets.exe",
+    "widgetservice.exe",
 }
 
 _user32 = ctypes.windll.user32
@@ -307,6 +327,41 @@ _dwmapi.DwmSetWindowAttribute.argtypes = [
     ctypes.c_uint,
 ]
 _dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long
+_dwmapi.DwmGetWindowAttribute.argtypes = [
+    ctypes.c_void_p,
+    ctypes.c_uint,
+    ctypes.c_void_p,
+    ctypes.c_uint,
+]
+_dwmapi.DwmGetWindowAttribute.restype = ctypes.c_long
+
+
+class _RECT(ctypes.Structure):
+    _fields_ = [
+        ("left", ctypes.c_long),
+        ("top", ctypes.c_long),
+        ("right", ctypes.c_long),
+        ("bottom", ctypes.c_long),
+    ]
+
+
+class _MONITORINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.c_ulong),
+        ("rcMonitor", _RECT),
+        ("rcWork", _RECT),
+        ("dwFlags", ctypes.c_ulong),
+    ]
+
+
+_user32.GetWindowRect.argtypes = [ctypes.c_void_p, ctypes.POINTER(_RECT)]
+_user32.GetWindowRect.restype = ctypes.c_bool
+_user32.MonitorFromWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+_user32.MonitorFromWindow.restype = ctypes.c_void_p
+_user32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.POINTER(_MONITORINFO)]
+_user32.GetMonitorInfoW.restype = ctypes.c_bool
+_user32.IsWindow.argtypes = [ctypes.c_void_p]
+_user32.IsWindow.restype = ctypes.c_bool
 if ctypes.sizeof(ctypes.c_void_p) == 8:
     _user32.GetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int]
     _user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
@@ -402,20 +457,103 @@ def _is_foreign_app_window(hwnd):
     return True
 
 
-def _is_discord_popout(hwnd):
-    if not hwnd:
-        return False
-    hwnd = int(hwnd)
-    if _window_exe_name(hwnd) not in DISCORD_EXES:
-        return False
+def _window_is_topmost(hwnd):
     try:
         if ctypes.sizeof(ctypes.c_void_p) == 8:
-            exstyle = _user32.GetWindowLongPtrW(hwnd, GWL_EXSTYLE)
+            exstyle = _user32.GetWindowLongPtrW(int(hwnd), GWL_EXSTYLE)
         else:
-            exstyle = _user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            exstyle = _user32.GetWindowLongW(int(hwnd), GWL_EXSTYLE)
         return bool(int(exstyle) & WS_EX_TOPMOST)
     except Exception:
         return False
+
+
+def _is_cloaked(hwnd):
+    cloaked = ctypes.c_int(0)
+    try:
+        status = _dwmapi.DwmGetWindowAttribute(
+            int(hwnd),
+            DWMWA_CLOAKED,
+            ctypes.byref(cloaked),
+            ctypes.sizeof(cloaked),
+        )
+    except Exception:
+        return False
+    return int(status) == 0 and int(cloaked.value) != 0
+
+
+def _window_frame(hwnd):
+    rect = _RECT()
+    if not _user32.GetWindowRect(int(hwnd), ctypes.byref(rect)):
+        return None
+    width = int(rect.right - rect.left)
+    height = int(rect.bottom - rect.top)
+    if width <= 0 or height <= 0:
+        return None
+    monitor = _user32.MonitorFromWindow(int(hwnd), MONITOR_DEFAULTTONEAREST)
+    info = _MONITORINFO()
+    info.cbSize = ctypes.sizeof(_MONITORINFO)
+    if not monitor or not _user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+        return width, height, width, height
+    mon_w = max(1, int(info.rcMonitor.right - info.rcMonitor.left))
+    mon_h = max(1, int(info.rcMonitor.bottom - info.rcMonitor.top))
+    return width, height, mon_w, mon_h
+
+
+def _is_floating_topmost(hwnd):
+    """Already-on-top camera / picture-in-picture windows, not a full-screen app."""
+    if not _window_is_topmost(hwnd):
+        return False
+    frame = _window_frame(hwnd)
+    if frame is None:
+        return False
+    width, height, mon_w, mon_h = frame
+    if width < 80 or height < 64:
+        return False
+    if width >= int(mon_w * 0.88) and height >= int(mon_h * 0.88):
+        return False
+    return True
+
+
+def _is_small_meeting_popout(hwnd):
+    """Compact Teams/Zoom call window that should sit above the whiteboard."""
+    frame = _window_frame(hwnd)
+    if frame is None:
+        return False
+    width, height, mon_w, mon_h = frame
+    if width < 160 or height < 120:
+        return False
+    if width > int(mon_w * 0.62) or height > int(mon_h * 0.62):
+        return False
+    if width * height > int(mon_w * mon_h * 0.38):
+        return False
+    # Very tall windows are usually popped-out chats, not camera tiles.
+    if width * 100 < height * 62:
+        return False
+    return True
+
+
+def _is_camera_popout(hwnd, include_meeting_popouts=True):
+    if not hwnd:
+        return False
+    hwnd = int(hwnd)
+    try:
+        if _user32.IsIconic(hwnd) or _is_cloaked(hwnd):
+            return False
+    except Exception:
+        return False
+    if not _is_foreign_app_window(hwnd):
+        return False
+    exe = _window_exe_name(hwnd)
+    if exe in FLOAT_IGNORE_EXES:
+        return False
+    if exe in DISCORD_EXES and _window_is_topmost(hwnd):
+        return True
+    if _is_floating_topmost(hwnd):
+        return True
+    if include_meeting_popouts and exe in MEETING_POPOUT_EXES and _is_small_meeting_popout(hwnd):
+        return True
+    return False
 
 
 def _window_exe_name(hwnd):
@@ -441,25 +579,18 @@ def _window_exe_name(hwnd):
         _kernel32.CloseHandle(process)
 
 
-def _discord_popout_hwnds(exclude_hwnd=None):
+def _camera_popout_hwnds(exclude_hwnd=None, include_meeting_popouts=True):
     found = []
     exclude = int(exclude_hwnd) if exclude_hwnd else 0
 
     @ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
     def callback(hwnd, _lparam):
         try:
-            if exclude and int(hwnd) == exclude:
+            hwnd = int(hwnd)
+            if exclude and hwnd == exclude:
                 return 1
-            if not _user32.IsWindowVisible(hwnd) or _user32.IsIconic(hwnd):
-                return 1
-            if ctypes.sizeof(ctypes.c_void_p) == 8:
-                exstyle = _user32.GetWindowLongPtrW(hwnd, GWL_EXSTYLE)
-            else:
-                exstyle = _user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-            if not (int(exstyle) & WS_EX_TOPMOST):
-                return 1
-            if _window_exe_name(hwnd) in DISCORD_EXES:
-                found.append(int(hwnd))
+            if _is_camera_popout(hwnd, include_meeting_popouts=include_meeting_popouts):
+                found.append(hwnd)
         except Exception:
             pass
         return 1
@@ -468,11 +599,58 @@ def _discord_popout_hwnds(exclude_hwnd=None):
     return found
 
 
-def _raise_discord_popouts(exclude_hwnd=None):
+_promoted_popouts = set()
+
+
+def _clear_window_topmost(hwnd):
+    _user32.SetWindowPos(
+        int(hwnd),
+        HWND_NOTOPMOST,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+    )
+
+
+def _release_promoted_popouts(hwnds=None):
+    if hwnds is None:
+        targets = list(_promoted_popouts)
+        _promoted_popouts.clear()
+    else:
+        targets = list(hwnds)
+        for hwnd in targets:
+            _promoted_popouts.discard(hwnd)
     if sys.platform != "win32":
         return
-    for hwnd in _discord_popout_hwnds(exclude_hwnd=exclude_hwnd):
+    for hwnd in targets:
+        try:
+            if _user32.IsWindow(hwnd):
+                _clear_window_topmost(hwnd)
+        except Exception:
+            pass
+
+
+def _raise_camera_popouts(exclude_hwnd=None, promote=True):
+    if sys.platform != "win32":
+        return
+    if not promote:
+        _release_promoted_popouts()
+    hwnds = _camera_popout_hwnds(
+        exclude_hwnd=exclude_hwnd,
+        include_meeting_popouts=promote,
+    )
+    if promote:
+        alive = set(hwnds)
+        _release_promoted_popouts(
+            [hwnd for hwnd in _promoted_popouts if hwnd not in alive]
+        )
+    for hwnd in hwnds:
+        was_topmost = _window_is_topmost(hwnd)
         _set_window_topmost(hwnd, activate=False)
+        if promote and not was_topmost:
+            _promoted_popouts.add(hwnd)
 
 
 ICON_INK = QColor(70, 70, 72)
@@ -1005,7 +1183,7 @@ class CollabBar(QFrame):
         layout.addWidget(QLabel("Nuoroda:"))
         self.link_edit = QLineEdit()
         self.link_edit.setReadOnly(True)
-        self.link_edit.setPlaceholderText("Ruošiama...")
+        self.link_edit.setPlaceholderText("Ruošiama vieša nuoroda...")
         layout.addWidget(self.link_edit, 1)
 
         self.copy_button = QPushButton("Kopijuoti")
@@ -1261,6 +1439,7 @@ class CanvasWidget(QWidget):
     def _serialize_stroke(self, stroke):
         return {
             "color": stroke["color"].name(),
+            "author": stroke.get("author", "host"),
             "points": [self._to_norm(point) for point in stroke["points"]],
         }
 
@@ -1421,7 +1600,39 @@ class CanvasWidget(QWidget):
         self._schedule_remote_repaint()
 
     def erase_remote(self, x, y):
-        self._erase_at(self._from_norm_f(x, y), mode=ERASER_OBJECT)
+        self._erase_guest_at(self._from_norm_f(x, y))
+
+    def _erase_guest_at(self, canvas_pos):
+        radius = float(self.eraser_width)
+        changed = False
+        remaining = []
+        for item in self.items:
+            if (
+                item.get("type") == "stroke"
+                and item.get("author") == "guest"
+                and _item_hit(item, canvas_pos, radius + self._item_width(item) * 0.5)
+            ):
+                changed = True
+                if item is self.selected_item:
+                    self.selected_item = None
+                    self._region_rect = None
+                continue
+            remaining.append(item)
+
+        live_remaining = {}
+        for stroke_id, stroke in self._remote_strokes.items():
+            if _item_hit(stroke, canvas_pos, radius + self._item_width(stroke) * 0.5):
+                changed = True
+                continue
+            live_remaining[stroke_id] = stroke
+        if live_remaining != self._remote_strokes:
+            self._remote_strokes = live_remaining
+
+        if changed:
+            self.items = remaining
+            self._cache_dirty = True
+            self.update()
+            self.content_changed.emit()
 
     def undo_guest(self):
         if self._remote_strokes:
@@ -1455,10 +1666,16 @@ class CanvasWidget(QWidget):
             return
         stroke = self._remote_strokes.get(stroke_id)
         if stroke is None:
-            self.begin_remote_stroke(stroke_id, "#1565c0", points[0][0], points[0][1])
+            first = points[0]
+            self.begin_remote_stroke(stroke_id, "#1565c0", float(first[0]), float(first[1]))
             points = points[1:]
-        for x, y in points:
-            stroke["points"].append(self._from_norm_f(float(x), float(y)))
+            stroke = self._remote_strokes.get(stroke_id)
+        if stroke is None:
+            return
+        for point in points:
+            if not point or len(point) < 2:
+                continue
+            stroke["points"].append(self._from_norm_f(float(point[0]), float(point[1])))
         self._schedule_remote_repaint()
 
     def end_remote_stroke(self, stroke_id):
@@ -1467,6 +1684,7 @@ class CanvasWidget(QWidget):
             self.items.append(stroke)
             self._cache_dirty = True
             self._schedule_remote_repaint()
+            self.content_changed.emit()
 
     def _schedule_remote_repaint(self):
         if not self._remote_repaint_timer.isActive():
@@ -3729,9 +3947,10 @@ class WhiteboardWindow(QWidget):
         self._restore_chip = RestoreChip()
         self._restore_chip.restore_requested.connect(self.restore_whiteboard)
         self._restore_chip.hide()
-        self._discord_timer = QTimer(self)
-        self._discord_timer.setInterval(400)
-        self._discord_timer.timeout.connect(self._keep_discord_on_top)
+        self._closing = False
+        self._popout_timer = QTimer(self)
+        self._popout_timer.setInterval(400)
+        self._popout_timer.timeout.connect(self._keep_camera_popouts_on_top)
         self._yield_timer = QTimer(self)
         self._yield_timer.setInterval(100)
         self._yield_timer.timeout.connect(self._yield_to_foreground_app)
@@ -3784,28 +4003,28 @@ class WhiteboardWindow(QWidget):
             _set_window_topmost(int(self.winId()))
         self.raise_()
         self.activateWindow()
-        self._keep_discord_on_top()
+        self._keep_camera_popouts_on_top()
 
-    def _keep_discord_on_top(self):
-        if self._is_minimized or not self.isVisible():
+    def _keep_camera_popouts_on_top(self):
+        if self._closing or self._is_minimized or not self.isVisible():
             return
         if self._capture_paused and self._freeze_window.isVisible() and sys.platform == "win32":
             _set_window_topmost(int(self._freeze_window.winId()), activate=False)
             _set_window_topmost(int(self.winId()), activate=False)
-        _raise_discord_popouts(exclude_hwnd=int(self.winId()))
+        _raise_camera_popouts(exclude_hwnd=int(self.winId()), promote=True)
 
     def showEvent(self, event):
         super().showEvent(event)
         if not self._is_minimized:
             self._force_topmost()
-            self._discord_timer.start()
+            self._popout_timer.start()
             self._yield_after = time.monotonic() + 0.45
             self._yield_timer.start()
 
     def focusOutEvent(self, event):
         super().focusOutEvent(event)
         if not self._is_minimized:
-            QTimer.singleShot(0, self._keep_discord_on_top)
+            QTimer.singleShot(0, self._keep_camera_popouts_on_top)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -3834,13 +4053,13 @@ class WhiteboardWindow(QWidget):
             return
         if not _is_foreign_app_window(hwnd):
             return
-        if _is_discord_popout(hwnd):
+        if _is_camera_popout(hwnd):
             return
         self.minimize_whiteboard(keep_other_app_focused=True)
 
     def minimize_whiteboard(self, keep_other_app_focused=False):
         self._is_minimized = True
-        self._discord_timer.stop()
+        self._popout_timer.stop()
         self._yield_timer.stop()
         self._freeze_window.hide()
         self.hide()
@@ -3852,7 +4071,7 @@ class WhiteboardWindow(QWidget):
         chip.show()
         if sys.platform == "win32":
             _set_window_topmost(int(chip.winId()), activate=not keep_other_app_focused)
-            _raise_discord_popouts(exclude_hwnd=int(chip.winId()))
+            _raise_camera_popouts(exclude_hwnd=int(chip.winId()), promote=False)
 
     def restore_whiteboard(self):
         self._is_minimized = False
@@ -3958,10 +4177,12 @@ class WhiteboardWindow(QWidget):
                 app.applicationStateChanged.disconnect(self._on_app_state_changed)
             except TypeError:
                 pass
+        self._closing = True
         self._is_minimized = False
-        self._discord_timer.stop()
+        self._popout_timer.stop()
         self._yield_timer.stop()
         self._resume_capture(force=True)
+        _release_promoted_popouts()
         self._freeze_window.hide()
         self._freeze_window.deleteLater()
         self._restore_chip.hide()
@@ -4053,7 +4274,7 @@ class WhiteboardWindow(QWidget):
         self._pause_banner.setText("Vaizdas pristabdytas — Discord / Teams šio piešimo nemato")
         self._place_pause_banner()
         self._pause_banner.show()
-        self._keep_discord_on_top()
+        self._keep_camera_popouts_on_top()
         return True
 
     def _resume_capture(self, force=False):
@@ -4142,9 +4363,11 @@ class WhiteboardWindow(QWidget):
         self.canvas.setFocus(Qt.ActiveWindowFocusReason)
 
     def _open_local_link(self):
-        url = self.collab_bar.current_url()
+        url = ""
         if self._collab is not None:
-            url = self._collab.lan_url
+            url = self._collab.local_url or self._collab.lan_url
+        if not url:
+            url = self.collab_bar.current_url()
         if not url:
             return
         if sys.platform == "win32":
@@ -4162,7 +4385,14 @@ class WhiteboardWindow(QWidget):
     def _bcast_stroke_start(self, stroke_id, color, x, y):
         if self._collab is not None:
             self._collab.broadcast(
-                {"type": "stroke_start", "id": stroke_id, "color": color, "x": x, "y": y}
+                {
+                    "type": "stroke_start",
+                    "id": stroke_id,
+                    "color": color,
+                    "x": x,
+                    "y": y,
+                    "author": "host",
+                }
             )
 
     def _bcast_stroke_point(self, stroke_id, x, y):
@@ -4179,7 +4409,9 @@ class WhiteboardWindow(QWidget):
             return
         for stroke_id, pts in self._pending_bcast.items():
             if pts:
-                self._collab.broadcast({"type": "stroke_points", "id": stroke_id, "pts": pts})
+                self._collab.broadcast(
+                    {"type": "stroke_points", "id": stroke_id, "pts": pts, "author": "host"}
+                )
         self._pending_bcast.clear()
 
     def _bcast_stroke_end(self, stroke_id):
@@ -4198,9 +4430,12 @@ class WhiteboardWindow(QWidget):
         self._bcast_state()
 
     def _bcast_state(self):
-        if self._collab is not None:
-            self._cached_state = self.canvas.export_state()
-            self._collab.broadcast({"type": "state", "state": self._cached_state})
+        if self._collab is None:
+            return
+        if self.canvas.width() < 50 or self.canvas.height() < 50:
+            return
+        self._cached_state = self.canvas.export_state()
+        self._collab.broadcast({"type": "state", "state": self._cached_state})
 
 
 class WhiteboardApp:
@@ -4234,8 +4469,12 @@ class WhiteboardApp:
         self._mutex_handle = _take_instance_mutex()
 
     def _collab_state_provider(self):
-        if self._whiteboard is not None:
-            return self._whiteboard.canvas.export_state()
+        board = self._whiteboard
+        if board is None:
+            return {}
+        state = getattr(board, "_cached_state", None)
+        if isinstance(state, dict) and state.get("canvasW", 0) > 2 and state.get("viewW", 0) > 2:
+            return state
         return {}
 
     def _log(self, message):

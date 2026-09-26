@@ -3,7 +3,7 @@
 
 #define AppName "Ekrano rašiklis"
 #define AppNameAscii "EkranoRasiklis"
-#define AppVersion "1.0.5"
+#define AppVersion "1.0.6"
 #define AppPublisher "Ekrano rašiklis"
 #define AppExeName "EkranoRasiklis.exe"
 

@@ -67,10 +67,10 @@ def _ws_accept(key):
     return base64.b64encode(digest).decode("ascii")
 
 
-def _ws_send(sock, payload, opcode=0x1):
+def _ws_send(sock, payload, opcode=0x1, lock=None):
     data = payload if isinstance(payload, bytes) else payload.encode("utf-8")
     header = bytearray()
-    header.append(0x80 | opcode)
+    header.append(0x80 | (opcode & 0x0F))
     length = len(data)
     if length < 126:
         header.append(length)
@@ -80,46 +80,120 @@ def _ws_send(sock, payload, opcode=0x1):
     else:
         header.append(127)
         header.extend(struct.pack("!Q", length))
-    sock.sendall(header + data)
+    packet = bytes(header) + data
+    if lock is None:
+        sock.sendall(packet)
+        return
+    with lock:
+        sock.sendall(packet)
 
 
-def _recv_exact(sock, n):
-    chunks = []
-    remaining = n
-    while remaining > 0:
-        chunk = sock.recv(remaining)
-        if not chunk:
-            raise ConnectionError("closed")
-        chunks.append(chunk)
-        remaining -= len(chunk)
-    return b"".join(chunks)
+class _SockReader:
+    def __init__(self, sock, leftover=b""):
+        self.sock = sock
+        self.buf = bytearray(leftover)
+
+    def pending(self):
+        return bool(self.buf)
+
+    def read(self, n):
+        while len(self.buf) < n:
+            chunk = self.sock.recv(max(4096, n - len(self.buf)))
+            if not chunk:
+                raise ConnectionError("closed")
+            self.buf.extend(chunk)
+        out = bytes(self.buf[:n])
+        del self.buf[:n]
+        return out
 
 
-def _ws_recv(sock):
-    header = _recv_exact(sock, 2)
-    opcode = header[0] & 0x0F
-    masked = (header[1] & 0x80) != 0
-    length = header[1] & 0x7F
-    if length == 126:
-        length = struct.unpack("!H", _recv_exact(sock, 2))[0]
-    elif length == 127:
-        length = struct.unpack("!Q", _recv_exact(sock, 8))[0]
-    if length > 1_000_000:
-        raise ConnectionError("frame too large")
-    mask = _recv_exact(sock, 4) if masked else b""
-    raw = _recv_exact(sock, length)
-    if masked:
-        raw = bytes(b ^ mask[i % 4] for i, b in enumerate(raw))
-    if opcode == 0x8:
-        return None
-    if opcode == 0x9:
-        _ws_send(sock, raw, opcode=0xA)
+def _ws_recv_message(reader, send_lock=None):
+    """Read one text message, including frames a tunnel splits into pieces."""
+    fragments = []
+    message_opcode = None
+    while True:
+        header = reader.read(2)
+        opcode = header[0] & 0x0F
+        fin = (header[0] & 0x80) != 0
+        masked = (header[1] & 0x80) != 0
+        length = header[1] & 0x7F
+        if length == 126:
+            length = struct.unpack("!H", reader.read(2))[0]
+        elif length == 127:
+            length = struct.unpack("!Q", reader.read(8))[0]
+        if length > 1_000_000:
+            raise ConnectionError("frame too large")
+        mask = reader.read(4) if masked else b""
+        raw = reader.read(length) if length else b""
+        if masked and raw:
+            raw = bytes(b ^ mask[i % 4] for i, b in enumerate(raw))
+        if opcode == 0x8:
+            return None
+        if opcode == 0x9:
+            _ws_send(reader.sock, raw, opcode=0xA, lock=send_lock)
+            continue
+        if opcode == 0xA:
+            continue
+        if opcode in (0x1, 0x2):
+            message_opcode = opcode
+            fragments = [raw]
+        elif opcode == 0x0 and message_opcode is not None:
+            fragments.append(raw)
+        else:
+            continue
+        if not fin:
+            continue
+        if message_opcode == 0x1:
+            return b"".join(fragments).decode("utf-8")
         return ""
-    if opcode == 0xA:
+
+
+def _compact_state(state):
+    """Keep pen strokes, drop huge pasted images that would drop the connection."""
+    if not isinstance(state, dict):
+        return {}
+
+    def dumps(value):
+        return json.dumps(value, separators=(",", ":"))
+
+    try:
+        if len(dumps(state)) <= 350000:
+            return state
+    except (TypeError, ValueError):
+        return {}
+    slim = {
+        "viewW": state.get("viewW", 1),
+        "viewH": state.get("viewH", 1),
+        "offsetX": state.get("offsetX", 0),
+        "offsetY": state.get("offsetY", 0),
+        "canvasW": state.get("canvasW", 1),
+        "canvasH": state.get("canvasH", 1),
+        "strokes": state.get("strokes") or [],
+        "images": [],
+        "texts": state.get("texts") or [],
+    }
+    try:
+        if len(dumps(slim)) <= 350000:
+            return slim
+    except (TypeError, ValueError):
+        pass
+    slim["strokes"] = []
+    slim["texts"] = []
+    return slim
+
+
+def _guess_lan_ip():
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(0.2)
+        sock.connect(("8.8.8.8", 80))
+        ip = sock.getsockname()[0]
+        sock.close()
+    except OSError:
         return ""
-    if opcode == 0x1:
-        return raw.decode("utf-8")
-    return ""
+    if not ip or ip.startswith("127."):
+        return ""
+    return ip
 
 
 def _read_http_request(sock):
@@ -243,8 +317,10 @@ class CollabSession:
         self.bridge = bridge
         self.allowed = False
         self.port = 0
+        self.local_url = ""
         self.lan_url = ""
         self.public_url = ""
+        self._send_lock = threading.Lock()
         self._running = False
         self._listen = None
         self._clients = []
@@ -278,13 +354,23 @@ class CollabSession:
         self._listen.listen(16)
         self._listen.settimeout(0.5)
         self.port = self._listen.getsockname()[1]
-        self.lan_url = "http://127.0.0.1:%s/?k=%s" % (self.port, self._token)
+        self.local_url = "http://127.0.0.1:%s/?k=%s" % (self.port, self._token)
+        lan_ip = _guess_lan_ip()
+        self.lan_url = ("http://%s:%s/?k=%s" % (lan_ip, self.port, self._token)) if lan_ip else ""
         save_session_config(self._token, self.port)
         self._running = True
         self._accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
         self._accept_thread.start()
         self.bridge.urls_changed.emit(self.lan_url, self.public_url)
-        self.bridge.status_changed.emit("Vietinė nuoroda paruošta. Kuriama vieša..." if enable_tunnel else "Vietinė nuoroda paruošta.")
+        if enable_tunnel and self.lan_url:
+            status = "Tame pačiame Wi-Fi jau galima. Kuriama vieša nuoroda..."
+        elif enable_tunnel:
+            status = "Kuriama vieša nuoroda..."
+        elif self.lan_url:
+            status = "Nuoroda tame pačiame Wi-Fi paruošta."
+        else:
+            status = "Vietinė nuoroda paruošta."
+        self.bridge.status_changed.emit(status)
         self._enable_tunnel = enable_tunnel
 
     def start_tunnel(self):
@@ -317,6 +403,9 @@ class CollabSession:
         self.broadcast({"type": "permission", "allowed": self.allowed})
 
     def broadcast(self, message, exclude=None):
+        if isinstance(message, dict) and message.get("type") in ("state", "hello") and "state" in message:
+            message = dict(message)
+            message["state"] = _compact_state(message.get("state"))
         payload = json.dumps(message, separators=(",", ":"))
         dead = []
         with self._clients_lock:
@@ -325,7 +414,7 @@ class CollabSession:
             if sock is exclude:
                 continue
             try:
-                _ws_send(sock, payload)
+                _ws_send(sock, payload, lock=self._send_lock)
             except OSError:
                 dead.append(sock)
         if dead:
@@ -358,14 +447,14 @@ class CollabSession:
         try:
             _configure_socket(conn)
             conn.settimeout(20)
-            method, path, headers, _leftover = _read_http_request(conn)
+            method, path, headers, leftover = _read_http_request(conn)
             _pathname, token = _query_token(path)
             upgrade = headers.get("upgrade", "").lower()
             if method == "GET" and upgrade == "websocket":
                 if token != self._token:
                     self._http_response(conn, 403, "text/plain; charset=utf-8", b"Neteisingas raktas")
                     return
-                self._websocket_client(conn, headers)
+                self._websocket_client(conn, headers, leftover)
                 return
             if method == "GET":
                 body = self._html.encode("utf-8")
@@ -396,7 +485,7 @@ class CollabSession:
             except OSError:
                 pass
 
-    def _websocket_client(self, conn, headers):
+    def _websocket_client(self, conn, headers, leftover=b""):
         key = headers.get("sec-websocket-key", "")
         if not key:
             conn.close()
@@ -413,33 +502,39 @@ class CollabSession:
         with self._clients_lock:
             self._clients.append(conn)
         self.bridge.guest_count_changed.emit(self.guest_count())
+        reader = _SockReader(conn, leftover)
         try:
+            try:
+                state = _compact_state(self._state_provider() or {})
+            except Exception:
+                state = {}
             _ws_send(
                 conn,
                 json.dumps(
-                    {
-                        "type": "hello",
-                        "allowed": self.allowed,
-                        "state": self._state_provider(),
-                    },
+                    {"type": "hello", "allowed": self.allowed, "state": state},
                     separators=(",", ":"),
                 ),
+                lock=self._send_lock,
             )
             while self._running:
-                ready, _, _ = select.select([conn], [], [], 30)
-                if not ready:
-                    try:
-                        _ws_send(conn, b"", opcode=0x9)
-                    except OSError:
-                        break
-                    continue
-                text = _ws_recv(conn)
+                if not reader.pending():
+                    ready, _, _ = select.select([conn], [], [], 30)
+                    if not ready:
+                        try:
+                            _ws_send(conn, b"", opcode=0x9, lock=self._send_lock)
+                        except OSError:
+                            break
+                        continue
+                text = _ws_recv_message(reader, self._send_lock)
                 if text is None:
                     break
                 if not text:
                     continue
-                self._on_guest_message(conn, text)
-        except (OSError, ConnectionError, ValueError):
+                try:
+                    self._on_guest_message(conn, text)
+                except Exception:
+                    continue
+        except (OSError, ConnectionError, UnicodeError, ValueError):
             pass
         finally:
             with self._clients_lock:
@@ -458,10 +553,22 @@ class CollabSession:
             return
         kind = message.get("type")
         if kind == "request_state":
-            _ws_send(conn, json.dumps({"type": "hello", "allowed": self.allowed, "state": self._state_provider()}))
+            try:
+                state = _compact_state(self._state_provider() or {})
+            except Exception:
+                state = {}
+            _ws_send(
+                conn,
+                json.dumps({"type": "hello", "allowed": self.allowed, "state": state}, separators=(",", ":")),
+                lock=self._send_lock,
+            )
             return
         if not self.allowed:
-            _ws_send(conn, json.dumps({"type": "permission", "allowed": False}))
+            _ws_send(
+                conn,
+                json.dumps({"type": "permission", "allowed": False}, separators=(",", ":")),
+                lock=self._send_lock,
+            )
             return
         if kind == "erase":
             self.bridge.remote_erase.emit(float(message.get("x", 0)), float(message.get("y", 0)))
@@ -474,6 +581,9 @@ class CollabSession:
         if not stroke_id:
             return
         color = str(message.get("color", "#1565c0"))
+        if kind in ("stroke_start", "stroke_point", "stroke_points", "stroke_end"):
+            message = dict(message)
+            message["author"] = "guest"
         if kind == "stroke_start":
             self.bridge.remote_stroke_start.emit(
                 stroke_id, color, float(message.get("x", 0)), float(message.get("y", 0))
@@ -538,9 +648,14 @@ class CollabSession:
                 return
 
         if self._running:
-            self.bridge.status_changed.emit(
-                "Vieša nuoroda nepavyko. Atidarykite vietinę nuorodą šiame kompiuteryje."
-            )
+            if self.lan_url:
+                self.bridge.status_changed.emit(
+                    "Vieša nuoroda nepavyko. Tame pačiame Wi-Fi naudokite rodomą nuorodą."
+                )
+            else:
+                self.bridge.status_changed.emit(
+                    "Vieša nuoroda nepavyko. Atidarykite vietinę nuorodą šiame kompiuteryje."
+                )
 
     def _try_tunnel_command(self, args, timeout):
         try:
